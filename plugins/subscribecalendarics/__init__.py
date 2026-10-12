@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, date
 import pytz
 from fastapi.responses import StreamingResponse
 import io
+import logging
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 from app.chain.media import MediaChain
@@ -13,6 +16,7 @@ from app.chain.tmdb import TmdbChain
 from app.core.context import MediaInfo
 from app.db.oper.subscribe import SubscribeOper
 from app.db.models.subscribe import Subscribe
+from app.schemas.types import MediaSource
 from app.plugins import _PluginBase
 from app.schemas import MediaType
 from app.schemas.tmdb import TmdbEpisode
@@ -26,7 +30,7 @@ class SubscribeCalendarIcs(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/hotlcc/MoviePilot-Plugins-Third/main/icons/SubscribeCalendarIcs.png"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     # noinspection SpellCheckingInspection
     plugin_author = "hotlcc"
@@ -273,22 +277,62 @@ class SubscribeCalendarIcs(_PluginBase):
             config_value = config_default.get(config_key)
         return config_value
 
+    @staticmethod
+    def __subscription_identity(sub: Subscribe):
+        source = MediaSource(sub.media_source)
+        media_id = str(sub.media_id).strip() if sub.media_id is not None else ''
+        if not media_id:
+            raise ValueError(f'订阅 {sub.id} 缺少 media_id')
+        return source, media_id
+
+    @staticmethod
+    def __media_uid(media_info: MediaInfo) -> str:
+        source = MediaSource(media_info.media_source).value
+        media_id = str(media_info.media_id).strip()
+        return f'{source}:{media_info.type.value}:{media_id}'
+
     async def __get_movie_info_async(self, sub: Subscribe) -> Tuple[MediaInfo, None]:
-        """
-        异步获取电影信息
-        """
-        media_info = await self.__media_chain.async_recognize_media(tmdbid=sub.tmdbid, doubanid=sub.doubanid, bangumiid=sub.bangumiid, mtype=MediaType.MOVIE)
+        source, media_id = self.__subscription_identity(sub)
+        media_info = await self.__media_chain.async_recognize_media(
+            media_source=source, media_id=media_id, mtype=MediaType.MOVIE
+        )
+        if media_info is None:
+            logger.warning('订阅日历：电影 %s (%s:%s) 未取得媒体信息，无法生成日程', sub.name, source.value, media_id)
+        else:
+            media_info.media_source = source
+            media_info.media_id = media_id
         return media_info, None
 
     async def __get_tv_info_async(self, sub: Subscribe) -> Tuple[MediaInfo, Optional[List[TmdbEpisode]]]:
-        """
-        异步获取电视剧信息
-        """
-        media_info = MediaInfo(type=MediaType.TV, title=sub.name, tmdb_id=sub.tmdbid, douban_id=sub.doubanid, bangumi_id=sub.bangumiid, season=sub.season)
-        if not sub.tmdbid or not sub.season:
-            return media_info, None
-        episode_list = await self.__tmdb_chain.async_tmdb_episodes(tmdbid=sub.tmdbid, season=sub.season)
-        return media_info, episode_list
+        source, media_id = self.__subscription_identity(sub)
+        episode_group = sub.episode_group
+        if source == MediaSource.TMDB:
+            tmdb_id = int(media_id)
+            media_info = MediaInfo(
+                type=MediaType.TV, title=sub.name, media_source=source,
+                media_id=media_id, tmdb_id=tmdb_id, season=sub.season
+            )
+        else:
+            media_info = await self.__media_chain.async_recognize_media(
+                media_source=source, media_id=media_id, mtype=MediaType.TV,
+                episode_group=episode_group
+            )
+            if media_info is None:
+                logger.warning('订阅日历：电视剧 %s (%s:%s) 未取得媒体信息，无法生成日程', sub.name, source.value, media_id)
+                return None, []
+            media_info.media_source = source
+            media_info.media_id = media_id
+            media_info.title = sub.name or media_info.title
+            media_info.season = sub.season
+            tmdb_id = media_info.tmdb_id
+        if sub.season is None or not tmdb_id:
+            logger.warning('订阅日历：电视剧 %s (%s:%s) 缺少 TMDB ID 或季号，无法查询逐集日程', sub.name, source.value, media_id)
+            return media_info, []
+        episode_list = await self.__tmdb_chain.async_tmdb_episodes(
+            tmdbid=int(tmdb_id), season=sub.season, episode_group=episode_group
+        )
+        return media_info, episode_list or []
+
 
     async def __get_calendar_data(self) -> Optional[List[dict]]:
         """
@@ -299,14 +343,17 @@ class SubscribeCalendarIcs(_PluginBase):
             return None
         # 异步任务集合
         async_tasks = []
+        task_subs = []
         for sub in subs:
             if not sub:
                 continue
             media_type = MediaType(sub.type) if sub.type else MediaType.UNKNOWN
             if MediaType.MOVIE == media_type:
                 async_tasks.append(asyncio.create_task(self.__get_movie_info_async(sub=sub)))
+                task_subs.append(sub)
             elif MediaType.TV == media_type:
                 async_tasks.append(asyncio.create_task(self.__get_tv_info_async(sub=sub)))
+                task_subs.append(sub)
         if not async_tasks:
             return None
         # 异步任务结果
@@ -315,7 +362,11 @@ class SubscribeCalendarIcs(_PluginBase):
             return None
         # 日历数据
         calendar_data = []
-        for async_result in async_results:
+        for sub, async_result in zip(task_subs, async_results):
+            if isinstance(async_result, BaseException):
+                raise RuntimeError(
+                    f"订阅日历：获取订阅 {sub.id} ({sub.name}) 的影视信息失败"
+                ) from async_result
             if not async_result:
                 continue
             media_info, detail = async_result
@@ -328,12 +379,12 @@ class SubscribeCalendarIcs(_PluginBase):
                     "title": media_info.title,
                     "date": media_info.release_date,
                     "link": media_info.detail_link,
-                    "uid": f"{media_info.tmdb_id or media_info.douban_id or media_info.bangumi_id}",
+                    "uid": self.__media_uid(media_info),
                 })
             elif MediaType.TV == media_info.type:
                 group_by_date = {}
-                for episode in detail:
-                    if not episode or not episode.air_date or not episode.episode_number:
+                for episode in detail or []:
+                    if not episode or not episode.air_date or episode.episode_number is None:
                         continue
                     episode_numbers = group_by_date.get(episode.air_date) or []
                     episode_numbers.append(episode.episode_number)
@@ -348,7 +399,7 @@ class SubscribeCalendarIcs(_PluginBase):
                         "title": title,
                         "date": air_date,
                         "link": media_info.detail_link,
-                        "uid": f"{media_info.tmdb_id or media_info.douban_id or media_info.bangumi_id}:{media_info.season}:{air_date}",
+                        "uid": f"{self.__media_uid(media_info)}:{media_info.season}:{air_date}",
                     })
         return calendar_data
 
@@ -401,7 +452,8 @@ class SubscribeCalendarIcs(_PluginBase):
                     #event.add('DESCRIPTION', None)
                     event.add('DTSTART', vDate(start_date))
                     event.add('DTEND', vDate(end_date))
-                    event.add('URL', data.get('link'))
+                    if data.get('link'):
+                        event.add('URL', data.get('link'))
                     event.add('DTSTAMP', now)
                     event.add('CREATED', now)
                     event.add('LAST-MODIFIED', now)
