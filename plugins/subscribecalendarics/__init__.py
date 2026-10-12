@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.chain.media import MediaChain
 from app.chain.tmdb import TmdbChain
 from app.core.context import MediaInfo
+from app.db.oper.subscribe import SubscribeOper
 from app.db.models.subscribe import Subscribe
 from app.plugins import _PluginBase
 from app.schemas import MediaType
@@ -25,7 +26,7 @@ class SubscribeCalendarIcs(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/hotlcc/MoviePilot-Plugins-Third/main/icons/SubscribeCalendarIcs.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     # noinspection SpellCheckingInspection
     plugin_author = "hotlcc"
@@ -293,7 +294,7 @@ class SubscribeCalendarIcs(_PluginBase):
         """
         获取日历数据
         """
-        subs = Subscribe.list()
+        subs = SubscribeOper().list()
         if not subs:
             return None
         # 异步任务集合
